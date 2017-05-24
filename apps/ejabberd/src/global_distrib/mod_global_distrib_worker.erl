@@ -19,12 +19,21 @@ handle_call({data, Data}, From, State) ->
     handle_cast({data, Data}, State).
 
 handle_cast({data, Data}, State) ->
-    {From, To, Acc} = erlang:binary_to_term(Data),
-    ejabberd_router:route(From, To, Acc),
+    case erlang:binary_to_term(Data) of
+        {From, To, Acc} -> ejabberd_router:route(From, To, Acc);
+        {insert_for_domain, Domain, PeerHost, Stamp} ->
+            mod_global_distrib_mapping:insert_for_domain(Domain, PeerHost, Stamp);
+        {delete_for_domain, Domain, PeerHost, Stamp} ->
+            mod_global_distrib_mapping:delete_for_domain(Domain, PeerHost, Stamp);
+        {insert_for_jid, Jid, PeerHost, Stamp} ->
+            mod_global_distrib_mapping:insert_for_jid(Jid, PeerHost, Stamp);
+        {delete_for_jid, Jid, PeerHost, Stamp} ->
+            mod_global_distrib_mapping:delete_for_jid(Jid, PeerHost, Stamp)
+    end,
     {noreply, State}.
 
 handle_info(_, State) ->
     {noreply, State}.
 
-terminate(Reason, State) ->
+terminate(_Reason, _State) ->
     ok.

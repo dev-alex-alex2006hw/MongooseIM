@@ -11,8 +11,7 @@
 %% API
 %%--------------------------------------------------------------------
 
-init([Server]) ->
-    {Addr, Port} = get_addr(Server),
+init([_Server, Addr, Port]) ->
     {ok, Socket} = gen_tcp:connect(Addr, Port, [binary, {active, false}]),
     {ok, TLSSocket} = fast_tls:tcp_to_tls(Socket, [{certfile, opt(certfile)}, {cafile, opt(cafile)}, connect]),
     fast_tls:setopts(TLSSocket, [{active, once}]),
@@ -42,9 +41,3 @@ terminate(_Reason, _State) ->
 
 opt(Key) ->
     mod_global_distrib_utils:opt(mod_global_distrib_sender, Key).
-
-get_addr(Server) ->
-    case ejabberd_config:get_local_option({global_distrib_addr, Server}) of
-        undefined -> {Server, opt(listen_port)};
-        Other -> Other
-    end.

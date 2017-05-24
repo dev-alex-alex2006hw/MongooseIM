@@ -22,91 +22,74 @@
 -include("ejabberd.hrl").
 -include("jlib.hrl").
 
--define(DOMAIN_TAB, mod_global_distrib_domain_cache_tab).
--define(JID_TAB, mod_global_distrib_jid_cache_tab).
+-record(global_distrib_session, {
+    key :: {_, _, _} | binary(),
+    bare :: {_, _, _} | undefined,
+    host :: binary(),
+    stamp :: integer()
+}).
 
 -export([start/2, stop/1]).
--export([for_domain/1, insert_for_domain/2, delete_for_domain/2, all_domains/0]).
--export([for_jid/1, insert_for_jid/2, delete_for_jid/2, clear_cache_for_jid/1]).
+-export([for_domain/1, insert_for_domain/3, delete_for_domain/3, all_domains/0]).
+-export([for_jid/1, insert_for_jid/3, delete_for_jid/3]).
 -export([register_subhost/2, unregister_subhost/2, user_present/2, user_not_present/5]).
-
-%%--------------------------------------------------------------------
-%% Callbacks
-%%--------------------------------------------------------------------
-
--callback put_session(DatabasePool :: atom(), JID :: binary(), Host :: binary()) -> ok.
--callback get_session(DatabasePool :: atom(), JID :: binary()) -> {ok, Host :: binary()} | term().
--callback delete_session(DatabasePool :: atom(), JID :: binary(), Host :: binary()) -> ok.
--callback put_domain(DatabasePool :: atom(), Domain :: binary(), Host :: binary()) -> ok.
--callback get_domain(DatabasePool :: atom(), Domain :: binary()) -> {ok, Host :: binary()} | term().
--callback delete_domain(DatabasePool :: atom(), Domain :: binary(), Host :: binary()) -> ok.
--callback get_domains(DatabasePool :: atom()) -> {ok, [Domain :: binary()]}.
 
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
 
-start(Host, Opts0) ->
-    Opts = [{database_pool, global}, {cache_missed, true},
-            {domain_lifetime_seconds, 600}, {jid_lifetime_seconds, 5}, {max_jids, 10000} | Opts0],
+insert_for_domain(Domain, From, Stamp) when is_binary(Domain), is_binary(From), is_integer(Stamp) ->
+    do_add(Domain, undefined, From, Stamp).
+
+insert_for_jid({_, _, Resource} = FullJid, From, Stamp)
+  when byte_size(Resource) > 0, is_binary(From), is_integer(Stamp) ->
+    BareJid = jid:to_bare(FullJid),
+    do_add(FullJid, BareJid, From, Stamp).
+
+delete_for_domain(Domain, From, Stamp) when is_binary(Domain), is_binary(From), is_integer(Stamp) ->
+    do_delete(Domain, From, Stamp).
+
+delete_for_jid({_, _, Resource} = FullJid, From, Stamp)
+  when byte_size(Resource) > 0, is_binary(From), is_integer(Stamp) ->
+    do_delete(FullJid, From, Stamp).
+
+for_domain(Domain) when is_binary(Domain) ->
+    case mnesia:dirty_read(global_distrib_session, Domain) of
+        [] -> error;
+        [#global_distrib_session{host = Host}] -> {ok, Host}
+    end.
+
+for_jid({_, _, <<>>} = BareJid) ->
+    case mnesia:dirty_index_read(global_distrib_session, BareJid, bare) of
+        [] -> error;
+        [#global_distrib_session{host = Host} | _] -> {ok, Host}
+    end;
+for_jid({_, _, _} = FullJid) ->
+    case mnesia:dirty_read(global_distrib_session, FullJid) of
+        [] -> for_jid(jid:to_bare(FullJid));
+        [#global_distrib_session{host = Host}] -> {ok, Host}
+    end.
+
+start(Host, Opts) ->
     mod_global_distrib_utils:start(?MODULE, Host, Opts, fun start/0).
 
 stop(Host) ->
     mod_global_distrib_utils:stop(?MODULE, Host, fun stop/0).
 
-for_domain(Domain) when is_binary(Domain) ->
-    ets_cache:lookup(?DOMAIN_TAB, Domain, fun() -> get_domain(Domain) end).
-
-insert_for_domain(Domain, Host) when is_binary(Domain), is_binary(Host) ->
-    ets_cache:update(?DOMAIN_TAB, Domain, {ok, Host}, fun() -> put_domain(Domain, Host) end).
-
-delete_for_domain(Domain, Host) when is_binary(Domain), is_binary(Host) ->
-    delete_domain(Domain, Host),
-    ets_cache:delete(?DOMAIN_TAB, Domain).
-
-for_jid(#jid{} = Jid) -> for_jid(jid:to_lower(Jid));
-for_jid({_, _, _} = Jid) ->
-    BinJid = jid:to_binary(Jid),
-    LookupInDB = fun(BJid) -> fun() -> get_session(BJid) end end,
-    case ets_cache:lookup(?JID_TAB, BinJid, LookupInDB(BinJid)) of
-        {ok, _} = Result -> Result;
-        Other ->
-            case jid:to_bare(Jid) of
-                Jid -> Other;
-                BareJid -> ets_cache:lookup(?JID_TAB, BinJid, LookupInDB(jid:to_binary(BareJid)))
-            end
-    end.
-
-insert_for_jid(#jid{} = Jid, Host) -> insert_for_jid(jid:to_lower(Jid), Host);
-insert_for_jid({_, _, _} = Jid, Host) when is_binary(Host) ->
-    lists:foreach(
-      fun(BinJid) ->
-              ets_cache:update(?JID_TAB, BinJid, {ok, Host}, fun() -> put_session(BinJid, Host) end)
-      end,
-      normalize_jid(Jid)).
-
-clear_cache_for_jid(Jid) when is_binary(Jid) ->
-    ets_cache:delete(?JID_TAB, Jid).
-
-delete_for_jid(#jid{} = Jid, Host) -> delete_for_jid(jid:to_lower(Jid), Host);
-delete_for_jid({_, _, _} = Jid, Host) when is_binary(Host) ->
-    lists:foreach(
-      fun(BinJid) ->
-              delete_session(BinJid, Host),
-              ets_cache:delete(?JID_TAB, BinJid)
-      end,
-      normalize_jid(Jid)).
-
 all_domains() ->
-    mod_global_distrib_mapping_backend:get_domains(opt(database_pool)).
+    DomainSessions = mnesia:dirty_index_read(global_distrib_session, undefined, bare),
+    {ok, [Domain || #global_distrib_session{key = Domain} <- DomainSessions]}.
 
 %%--------------------------------------------------------------------
 %% Hooks implementation
 %%--------------------------------------------------------------------
 
 -spec user_present(Acc :: map(), UserJID :: ejabberd:jid()) -> ok.
-user_present(Acc, #jid{} = UserJid) ->
-    insert_for_jid(UserJid, opt(local_host)),
+user_present(Acc, #jid{} = Jid) ->
+    Now = stamp(),
+    UserJid = jid:to_lower(Jid),
+    insert_for_jid(UserJid, opt(local_host), Now),
+    mod_global_distrib_sender:send_all({insert_for_jid, UserJid, opt(local_host), Now}),
     Acc.
 
 -spec user_not_present(Acc :: map(),
@@ -115,11 +98,14 @@ user_present(Acc, #jid{} = UserJid) ->
                        Resource :: ejabberd:lresource(),
                        _Status :: any()) -> ok.
 user_not_present(Acc, User, Host, Resource, _Status) ->
-    UserJid = {User, Host, Resource},
-    delete_for_jid(UserJid, opt(local_host)),
+    Now = stamp(),
+    UserJid = jid:to_lower({User, Host, Resource}),
+    delete_for_jid(UserJid, opt(local_host), Now),
+    mod_global_distrib_sender:send_all({delete_for_jid, UserJid, opt(local_host), Now}),
     Acc.
 
 register_subhost(_, SubHost) ->
+    Now = stamp(),
     IsSubhostOf =
         fun(Host) ->
                 case binary:match(SubHost, Host) of
@@ -130,12 +116,18 @@ register_subhost(_, SubHost) ->
 
     GlobalHost = opt(global_host),
     case lists:filter(IsSubhostOf, ?MYHOSTS) of
-        [GlobalHost] -> insert_for_domain(SubHost, opt(local_host));
-        _ -> ok
+        [GlobalHost] ->
+            insert_for_domain(SubHost, opt(local_host), Now),
+            mod_global_distrib_sender:send_all({insert_for_domain, SubHost, opt(local_host), Now});
+
+        _ ->
+            ok
     end.
 
 unregister_subhost(_, SubHost) ->
-    delete_for_domain(SubHost, opt(local_host)).
+    Now = stamp(),
+    delete_for_domain(SubHost, opt(local_host), Now),
+    mod_global_distrib_sender:send_all({delete_for_domain, SubHost, opt(local_host), Now}).
 
 %%--------------------------------------------------------------------
 %% Helpers
@@ -143,57 +135,48 @@ unregister_subhost(_, SubHost) ->
 
 start() ->
     Host = opt(global_host),
-    gen_mod:start_backend_module(?MODULE, [{backend, cassandra}]),
 
-    CacheMissed = opt(cache_missed),
-    DomainLifetime = opt(domain_lifetime_seconds) * 1000,
-    JidLifetime = opt(jid_lifetime_seconds) * 1000,
-    MaxJids = opt(max_jids),
+    mnesia:create_table(global_distrib_session,
+                        [{ram_copies, [node()]}, {index, [bare, host]},
+                         {attributes, record_info(fields, global_distrib_session)}]),
+    mnesia:add_table_copy(global_distrib_session, node(), ram_copies),
 
     ejabberd_hooks:add(register_subhost, global, ?MODULE, register_subhost, 90),
     ejabberd_hooks:add(unregister_subhost, global, ?MODULE, unregister_subhost, 90),
     ejabberd_hooks:add(user_available_hook, Host, ?MODULE, user_present, 90),
-    ejabberd_hooks:add(unset_presence_hook, Host, ?MODULE, user_not_present, 90),
-
-    ets_cache:new(?DOMAIN_TAB, [{cache_missed, CacheMissed}, {life_time, DomainLifetime}]),
-    ets_cache:new(?JID_TAB, [{cache_missed, CacheMissed}, {life_time, JidLifetime},
-                             {max_size, MaxJids}]).
+    ejabberd_hooks:add(unset_presence_hook, Host, ?MODULE, user_not_present, 90).
 
 stop() ->
     Host = opt(global_host),
 
-    ets_cache:delete(?JID_TAB),
-    ets_cache:delete(?DOMAIN_TAB),
-
     ejabberd_hooks:delete(unset_presence_hook, Host, ?MODULE, user_not_present, 90),
     ejabberd_hooks:delete(user_available_hook, Host, ?MODULE, user_present, 90),
     ejabberd_hooks:delete(unregister_subhost, global, ?MODULE, unregister_subhost, 90),
-    ejabberd_hooks:delete(register_subhost, global, ?MODULE, register_subhost, 90).
+    ejabberd_hooks:delete(register_subhost, global, ?MODULE, register_subhost, 90),
 
+    mnesia:delete_table(global_distrib_session).
 
-normalize_jid({_, _, _} = FullJid) ->
-    case jid:to_bare(FullJid) of
-        FullJid -> [jid:to_binary(FullJid)];
-        BareJid -> [jid:to_binary(FullJid), jid:to_binary(BareJid)]
-    end.
+do_add(Key, Bare, From, Stamp) ->
+    mnesia:transaction(fun() ->
+        case mnesia:read(global_distrib_session, Key, write) of
+            [#global_distrib_session{stamp = OldStamp}] when OldStamp > Stamp -> ok;
+            _ -> mnesia:write(#global_distrib_session{key = Key, bare = Bare,
+                                                      host = From, stamp = Stamp})
+        end
+    end).
+
+do_delete(Key, From, Stamp) ->
+    mnesia:transaction(fun() ->
+        case mnesia:read(global_distrib_session, Key, write) of
+            [#global_distrib_session{host = From, stamp = OldStamp}] when OldStamp =< Stamp ->
+                mnesia:delete({global_distrib_session, Key});
+            _ ->
+                ok
+        end
+    end).
 
 opt(Key) ->
     mod_global_distrib_utils:opt(?MODULE, Key).
 
-get_session(Key) ->
-    mod_global_distrib_mapping_backend:get_session(opt(database_pool), Key).
-
-put_session(Key, Value) ->
-    mod_global_distrib_mapping_backend:put_session(opt(database_pool), Key, Value).
-
-delete_session(Key, Value) ->
-    mod_global_distrib_mapping_backend:delete_session(opt(database_pool), Key, Value).
-
-get_domain(Key) ->
-    mod_global_distrib_mapping_backend:get_domain(opt(database_pool), Key).
-
-put_domain(Key, Value) ->
-    mod_global_distrib_mapping_backend:put_domain(opt(database_pool), Key, Value).
-
-delete_domain(Key, Value) ->
-    mod_global_distrib_mapping_backend:delete_domain(opt(database_pool), Key, Value).
+stamp() ->
+    p1_time_compat:system_time().
