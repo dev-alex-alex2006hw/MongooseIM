@@ -47,7 +47,6 @@ maybe_reroute(drop) -> drop;
 maybe_reroute({_From, To, _Acc} = FPacket) ->
     LocalHost = opt(local_host),
     GlobalHost = opt(global_host),
-    % Cookie = opt(cookie),
     case lookup_recipients_host(To, LocalHost, GlobalHost) of
         {ok, LocalHost} -> FPacket;
         {ok, TargetHost} -> mod_global_distrib_sender:send(TargetHost, FPacket), drop;

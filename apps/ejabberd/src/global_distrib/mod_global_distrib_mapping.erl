@@ -41,6 +41,8 @@
 insert_for_domain(Domain, From, Stamp) when is_binary(Domain), is_binary(From), is_integer(Stamp) ->
     do_add(Domain, undefined, From, Stamp).
 
+insert_for_jid(#jid{} = Jid, From, Stamp) ->
+    insert_for_jid(jid:to_lower(Jid), From, Stamp);
 insert_for_jid({_, _, Resource} = FullJid, From, Stamp)
   when byte_size(Resource) > 0, is_binary(From), is_integer(Stamp) ->
     BareJid = jid:to_bare(FullJid),
@@ -49,6 +51,8 @@ insert_for_jid({_, _, Resource} = FullJid, From, Stamp)
 delete_for_domain(Domain, From, Stamp) when is_binary(Domain), is_binary(From), is_integer(Stamp) ->
     do_delete(Domain, From, Stamp).
 
+delete_for_jid(#jid{} = Jid, From, Stamp) ->
+    delete_for_jid(jid:to_lower(Jid), From, Stamp);
 delete_for_jid({_, _, Resource} = FullJid, From, Stamp)
   when byte_size(Resource) > 0, is_binary(From), is_integer(Stamp) ->
     do_delete(FullJid, From, Stamp).
@@ -59,6 +63,8 @@ for_domain(Domain) when is_binary(Domain) ->
         [#global_distrib_session{host = Host}] -> {ok, Host}
     end.
 
+for_jid(#jid{} = Jid) ->
+    for_jid(jid:to_lower(Jid));
 for_jid({_, _, <<>>} = BareJid) ->
     case mnesia:dirty_index_read(global_distrib_session, BareJid, bare) of
         [] -> error;

@@ -20,12 +20,10 @@ stop(Host) ->
     mod_global_distrib_utils:stop(?MODULE, Host, fun stop/0).
 
 start() ->
-    LocalHost = opt(local_host),
-    Servers = lists:map(fun({Server, _, _}) -> Server; (Server) -> Server end, opt(servers)),
-    Names = [server_to_atom(Server) || Server <- Servers, Server =/= LocalHost],
+    Names = [Name || {Name, _Args} <- connection_args()],
     ets:insert(?MODULE, {server_names, Names}),
     ChildSpec = {?MODULE, {?MODULE, start_link, []}, transient, 1000, supervisor, [?MODULE]},
-    supervisor:start_child(ejabberd_sup, ChildSpec).
+    {ok, _} = supervisor:start_child(ejabberd_sup, ChildSpec).
 
 stop() ->
     ok.
@@ -33,11 +31,11 @@ stop() ->
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-
 send_all(Data) when is_binary(Data) ->
     lists:foreach(fun(Name) ->
-        Worker = wpool_pool:best_worker(Name),
-        mod_global_distrib_utils:cast_or_call(wpool_process, Worker, {data, Data})
+        ecpool:with_client(Name, fun(Client) ->
+             mod_global_distrib_utils:cast_or_call(gen_server, Client, {data, Data})
+        end)
     end, opt(server_names));
 send_all(Term) ->
     send_all(term_to_binary(Term)).
@@ -48,39 +46,46 @@ send(Server, {From, _To, Acc} = Packet) ->
     ejabberd_hooks:run(global_distrib_send_packet, [From, mongoose_acc:get(to_send, Acc)]),
     ok;
 send(Server, Data) when is_binary(Data) ->
-    Worker = get_process_for(Server),
-    ok = mod_global_distrib_utils:cast_or_call(wpool_process, Worker, {data, Data}).
-
-get_process_for(Server) ->
-    Name = server_to_atom(Server),
-    wpool_pool:best_worker(Name).
+    ecpool:with_client(server_to_atom(Server), fun(Client) ->
+         mod_global_distrib_utils:cast_or_call(gen_server, Client, {data, Data})
+    end).
 
 init(_) ->
-    LocalHost = opt(local_host),
-    Servers = opt(servers),
-    WorkerArgs = lists:filtermap(
+    Children =
+        lists:map(
+            fun({Name, {Server, Addr, Port}}) ->
+                Opts = [
+                    {server, Server},
+                    {host, Addr},
+                    {port, Port},
+                    {pool_size, opt(num_of_connections)},
+                    {pool_type, random},
+                    {auto_reconnect, 5}
+                ],
+                ecpool:pool_spec(Name, Name, mod_global_distrib_connection, Opts)
+            end,
+            connection_args()),
+
+    {ok, {{one_for_one, 5, 60}, Children}}.
+
+server_to_atom(Server) when is_binary(Server) ->
+    binary_to_atom(base64:encode(Server), latin1);
+server_to_atom(Server) ->
+    server_to_atom(unicode:characters_to_binary(Server)).
+
+
+connection_args() ->
+    LocalHostList = unicode:characters_to_list(opt(local_host)),
+    lists:filtermap(
         fun
-            ({Server, Addr, Port}) when Server =/= LocalHost ->
-                {true, {server_to_atom(Server), [Server, Addr, Port]}};
-            (Server) when Server =/= LocalHost ->
-                {true, {server_to_atom(Server), [Server, Server, opt(listen_port)]}};
+            ({Server, Addr, Port}) when is_list(Server), Server =/= LocalHostList ->
+                {true, {server_to_atom(Server), {Server, Addr, Port}}};
+            (Server) when is_list(Server), Server =/= LocalHostList ->
+                {true, {server_to_atom(Server), {Server, Server, opt(listen_port)}}};
             (_) ->
                 false
         end,
-        Servers),
-
-    Children = lists:map(
-        fun({Name, Args}) ->
-            PoolArgs = [Name, [{workers, opt(num_of_connections)},
-                               {worker, {mod_global_distrib_connection, Args}}]],
-            {wpool_pool, {wpool_pool, start_link, PoolArgs}, permanent, 5000, worker, dynamic}
-        end,
-        WorkerArgs),
-
-    {ok, {{one_for_one, 1000000, 1}, Children}}.
-
-server_to_atom(Server) ->
-    binary_to_atom(base64:encode(Server), latin1).
+        opt(servers)).
 
 opt(Key) ->
     mod_global_distrib_utils:opt(?MODULE, Key).
