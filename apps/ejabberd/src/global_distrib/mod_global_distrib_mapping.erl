@@ -18,6 +18,7 @@
 -author('konrad.zemek@erlang-solutions.com').
 
 -behaviour(gen_mod).
+-behaviour(gen_server).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
@@ -29,10 +30,11 @@
     stamp :: integer()
 }).
 
--export([start/2, stop/1]).
+-export([deps/2, start/2, stop/1]).
 -export([for_domain/1, insert_for_domain/3, delete_for_domain/3, all_domains/0]).
 -export([for_jid/1, insert_for_jid/3, delete_for_jid/3]).
 -export([register_subhost/2, unregister_subhost/2, user_present/2, user_not_present/5]).
+-export([start_link/0, init/1, handle_info/2, terminate/2]).
 
 %%--------------------------------------------------------------------
 %% API
@@ -76,6 +78,9 @@ for_jid({_, _, _} = FullJid) ->
         [#global_distrib_session{host = Host}] -> {ok, Host}
     end.
 
+deps(Host, Opts) ->
+    mod_global_distrib_utils:deps(?MODULE, Host, Opts, fun deps/1).
+
 start(Host, Opts) ->
     mod_global_distrib_utils:start(?MODULE, Host, Opts, fun start/0).
 
@@ -95,7 +100,7 @@ user_present(Acc, #jid{} = Jid) ->
     Now = stamp(),
     UserJid = jid:to_lower(Jid),
     insert_for_jid(UserJid, opt(local_host), Now),
-    mod_global_distrib_sender:send_all({insert_for_jid, UserJid, opt(local_host), Now}),
+    mod_global_distrib_sender:send_all({insert, UserJid, opt(local_host), Now}),
     Acc.
 
 -spec user_not_present(Acc :: map(),
@@ -107,7 +112,7 @@ user_not_present(Acc, User, Host, Resource, _Status) ->
     Now = stamp(),
     UserJid = jid:to_lower({User, Host, Resource}),
     delete_for_jid(UserJid, opt(local_host), Now),
-    mod_global_distrib_sender:send_all({delete_for_jid, UserJid, opt(local_host), Now}),
+    mod_global_distrib_sender:send_all({delete, UserJid, opt(local_host), Now}),
     Acc.
 
 register_subhost(_, SubHost) ->
@@ -124,8 +129,7 @@ register_subhost(_, SubHost) ->
     case lists:filter(IsSubhostOf, ?MYHOSTS) of
         [GlobalHost] ->
             insert_for_domain(SubHost, opt(local_host), Now),
-            mod_global_distrib_sender:send_all({insert_for_domain, SubHost, opt(local_host), Now});
-
+            mod_global_distrib_sender:send_all({insert, SubHost, opt(local_host), Now});
         _ ->
             ok
     end.
@@ -133,11 +137,14 @@ register_subhost(_, SubHost) ->
 unregister_subhost(_, SubHost) ->
     Now = stamp(),
     delete_for_domain(SubHost, opt(local_host), Now),
-    mod_global_distrib_sender:send_all({delete_for_domain, SubHost, opt(local_host), Now}).
+    mod_global_distrib_sender:send_all({delete, SubHost, opt(local_host), Now}).
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+deps(_Opts) ->
+    [{mod_global_distrib_sender, hard}].
 
 start() ->
     Host = opt(global_host),
@@ -150,10 +157,16 @@ start() ->
     ejabberd_hooks:add(register_subhost, global, ?MODULE, register_subhost, 90),
     ejabberd_hooks:add(unregister_subhost, global, ?MODULE, unregister_subhost, 90),
     ejabberd_hooks:add(user_available_hook, Host, ?MODULE, user_present, 90),
-    ejabberd_hooks:add(unset_presence_hook, Host, ?MODULE, user_not_present, 90).
+    ejabberd_hooks:add(unset_presence_hook, Host, ?MODULE, user_not_present, 90),
+
+    ChildSpec = {?MODULE, {?MODULE, start_link, []}, transient, 1000, worker, [?MODULE]},
+    {ok, _} = supervisor:start_child(ejabberd_sup, ChildSpec).
 
 stop() ->
     Host = opt(global_host),
+
+    supervisor:terminate_child(ejabberd_sup, ?MODULE),
+    supervisor:delete_child(ejabberd_sup, ?MODULE),
 
     ejabberd_hooks:delete(unset_presence_hook, Host, ?MODULE, user_not_present, 90),
     ejabberd_hooks:delete(user_available_hook, Host, ?MODULE, user_present, 90),
@@ -186,3 +199,32 @@ opt(Key) ->
 
 stamp() ->
     p1_time_compat:system_time().
+
+%% -----------------
+
+start_link() ->
+    gen_server:start_link(?MODULE, [], []).
+
+init(_) ->
+    Pools = mod_global_distrib_sender:subscribe_to_all(),
+    [self() ! {reconnected, PoolName} || {PoolName, connected} <- Pools],
+    [self() ! {disconnected, PoolName} || {PoolName, disconnected} <- Pools],
+    {ok, state}.
+
+handle_info({reconnected, PoolName}, State) ->
+    mnesia:transaction(fun() ->
+        LocalEntries = mnesia:index_read(global_distrib_session, opt(local_host), host),
+        Data = [{insert, Key, Host, Stamp} || #global_distrib_session{key = Key, host = Host, stamp = Stamp} <- LocalEntries],
+        mod_global_distrib_sender:send(PoolName, Data)
+    end),
+    {noreply, State};
+handle_info({disconnected, PoolName}, State) ->
+    DisconnectedServer = mod_global_distrib_sender:poolname_to_server(PoolName),
+    mnesia:transaction(fun() ->
+        Entries = mnesia:index_read(global_distrib_session, DisconnectedServer, host),
+        [mnesia:delete_object(Entry) || Entry <- Entries]
+    end),
+    {noreply, State}.
+
+terminate(_, _) ->
+    ignore.
